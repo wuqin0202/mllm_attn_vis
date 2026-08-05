@@ -12,6 +12,7 @@ from PIL import Image
 
 from vlm_attention_viz.app import (
     SessionCache,
+    append_image_resize_specs,
     build_selector_state,
     load_server_image,
     render_cached_session,
@@ -48,8 +49,44 @@ def _session(tag="session"):
         selectable_positions=np.array([0, 1, 3, 4, 5, 6]),
         generated_positions=np.array([4, 5, 6]),
         query_positions=np.array([0, 1, 3, 4, 5, 6]),
-        layers={2: SimpleNamespace(visual=np.zeros((2, 6, 1))), 7: SimpleNamespace(visual=np.zeros((3, 6, 1)))},
+        images=(Image.new("RGB", (1, 1), "white"), Image.new("RGB", (1, 1), "black")),
+        visual_grid_hws=((1, 1), (1, 1)),
+        model_input_sizes=((32, 32), (32, 32)),
+        layers={
+            2: SimpleNamespace(visual=np.zeros((2, 6, 2))),
+            7: SimpleNamespace(visual=np.zeros((3, 6, 2))),
+        },
     )
+
+
+def _resize_specs(*sizes):
+    return [{"width": width, "height": height} for width, height in sizes]
+
+
+class ResizeSpecTest(unittest.TestCase):
+    def test_append_preserves_existing_specs_without_inspecting_old_pixels(self):
+        first = Image.new("RGB", (10, 20), "red")
+        specs = append_image_resize_specs([first])
+        specs[0]["width"] = 101
+        specs[0]["height"] = 102
+
+        reencoded_first = Image.new("RGB", (10, 20), "pink")
+        second = Image.new("RGB", (30, 40), "blue")
+        appended = append_image_resize_specs([reencoded_first, second], specs)
+
+        self.assertEqual(
+            [(spec["width"], spec["height"]) for spec in appended],
+            [(101, 102), (30, 40)],
+        )
+        self.assertEqual(appended[0]["id"], specs[0]["id"])
+        self.assertNotEqual(appended[0]["id"], appended[1]["id"])
+
+    def test_deletion_requires_the_indexed_delete_event(self):
+        specs = append_image_resize_specs(
+            [Image.new("RGB", (10, 20)), Image.new("RGB", (30, 40))]
+        )
+        with self.assertRaisesRegex(ValueError, "delete event"):
+            append_image_resize_specs([Image.new("RGB", (10, 20))], specs)
 
 
 class SessionCacheTest(unittest.TestCase):
@@ -94,30 +131,44 @@ class CallbackTest(unittest.TestCase):
                 "  ",
                 32,
                 "cpu",
-                2,
-                2,
+                [],
+            )
+        with self.assertRaisesRegex(ValueError, "Resize settings"):
+            run_inference(
+                cache,
+                extractor,
+                object(),
+                object(),
+                [
+                    (Image.new("RGB", (2, 2)), None),
+                    (Image.new("RGB", (3, 3)), None),
+                ],
+                "",
+                "describe",
+                32,
+                "cpu",
+                _resize_specs((2, 2)),
             )
         self.assertEqual(calls, [])
 
         run_inference(
-            cache, extractor, object(), object(), None, "", "describe", 32, "cpu", None, None
+            cache, extractor, object(), object(), None, "", "describe", 32, "cpu", []
         )
         run_inference(
             cache,
             extractor,
             object(),
             object(),
-            Image.new("RGB", (2, 2)),
+            [(Image.new("RGB", (2, 2)), None)],
             "",
             "  ",
             32,
             "cpu",
-            2,
-            2,
+            _resize_specs((2, 2)),
         )
         self.assertEqual(len(calls), 2)
-        self.assertIsNone(calls[0]["image"])
-        self.assertIsNone(calls[0]["resize_width"])
+        self.assertEqual(calls[0]["images"], ())
+        self.assertEqual(calls[0]["resize_sizes"], ())
 
     def test_success_is_cached_and_failure_is_not(self):
         cache = SessionCache()
@@ -129,20 +180,19 @@ class CallbackTest(unittest.TestCase):
                 raise RuntimeError("temporary failure")
             return _session()
 
-        image = Image.new("RGB", (2, 2))
+        images = [(Image.new("RGB", (2, 2)), None), (Image.new("RGB", (3, 2)), "second")]
         with self.assertRaisesRegex(RuntimeError, "temporary"):
             run_inference(
                 cache,
                 extractor,
                 "model",
                 "processor",
-                image,
+                images,
                 "sys",
                 "user",
                 12,
                 "cpu",
-                resize_width=2,
-                resize_height=2,
+                resize_specs=_resize_specs((2, 2), (3, 4)),
             )
         self.assertEqual(len(cache), 0)
 
@@ -151,20 +201,20 @@ class CallbackTest(unittest.TestCase):
             extractor,
             "model",
             "processor",
-            image,
+            images,
             "sys",
             "user",
             12,
             "cpu",
-            resize_width=2,
-            resize_height=2,
+            resize_specs=_resize_specs((2, 2), (3, 4)),
         )
         self.assertEqual(len(cache), 1)
         self.assertIs(cache.get(session_id), selector.session)
         self.assertEqual(calls[-1]["system_prompt"], "sys")
         self.assertEqual(calls[-1]["user_prompt"], "user")
+        self.assertEqual([image.size for image in calls[-1]["images"]], [(2, 2), (3, 2)])
 
-    def test_independent_dimensions_are_forwarded_without_aspect_fit(self):
+    def test_per_image_dimensions_are_forwarded_without_aspect_fit(self):
         calls = []
 
         def extractor(**kwargs):
@@ -176,17 +226,18 @@ class CallbackTest(unittest.TestCase):
             extractor,
             object(),
             object(),
-            Image.new("RGB", (400, 200)),
+            [
+                (Image.new("RGB", (400, 200)), None),
+                (Image.new("RGB", (300, 500)), None),
+            ],
             "",
             "describe",
             8,
             "cpu",
-            resize_width=100,
-            resize_height=75,
+            resize_specs=_resize_specs((100, 75), (240, 360)),
         )
 
-        self.assertEqual(calls[0]["resize_width"], 100)
-        self.assertEqual(calls[0]["resize_height"], 75)
+        self.assertEqual(calls[0]["resize_sizes"], ((100, 75), (240, 360)))
 
     def test_render_only_changes_never_invoke_inference(self):
         cache = SessionCache()
@@ -197,8 +248,10 @@ class CallbackTest(unittest.TestCase):
             inference_calls.append(kwargs)
             return _session()
 
-        def renderer(session, generated_position, layer, head, opacity):
-            render_calls.append((session.tag, generated_position, layer, head, opacity))
+        def renderer(session, generated_position, layer, head, image_index, opacity):
+            render_calls.append(
+                (session.tag, generated_position, layer, head, image_index, opacity)
+            )
             return {"selection": render_calls[-1]}
 
         session_id, _ = run_inference(
@@ -206,15 +259,18 @@ class CallbackTest(unittest.TestCase):
             extractor,
             "model",
             "processor",
-            Image.new("RGB", (2, 2)),
+            [(Image.new("RGB", (2, 2)), None)],
             "",
             "user",
             8,
             "cpu",
-            resize_width=2,
-            resize_height=2,
+            resize_specs=_resize_specs((2, 2)),
         )
-        for selection in ((4, 2, "Mean", 0.3), (5, 7, 1, 0.8), (6, 7, 2, 1.0)):
+        for selection in (
+            (4, 2, "Mean", 0, 0.3),
+            (5, 7, 1, 1, 0.8),
+            (6, 7, 2, 0, 1.0),
+        ):
             render_cached_session(cache, session_id, *selection, renderer=renderer)
 
         self.assertEqual(len(inference_calls), 1)
@@ -222,8 +278,11 @@ class CallbackTest(unittest.TestCase):
 
     def test_workbench_render_keeps_only_causal_context_and_image_mass(self):
         session = _session()
-        session.image = Image.new("RGB", (2, 2), "white")
-        session.visual_grid_hw = (1, 1)
+        session.images = (
+            Image.new("RGB", (2, 2), "white"),
+            Image.new("RGB", (2, 2), "black"),
+        )
+        session.visual_grid_hws = ((1, 1), (1, 1))
         session.context_key_positions = np.array([0, 1, 3, 4, 5, 6])
         session.causal_context_mask = np.array(
             [
@@ -239,21 +298,23 @@ class CallbackTest(unittest.TestCase):
             2: SimpleNamespace(
                 visual=np.array(
                     [
-                        [[0.1], [0.1], [0.1], [0.2], [0.3], [0.4]],
-                        [[0.1], [0.1], [0.1], [0.4], [0.5], [0.6]],
+                        [[0.1, 0.6], [0.1, 0.6], [0.1, 0.6], [0.2, 0.7], [0.3, 0.8], [0.4, 0.9]],
+                        [[0.1, 0.8], [0.1, 0.8], [0.1, 0.8], [0.4, 0.9], [0.5, 1.0], [0.6, 1.1]],
                     ]
                 ),
                 context=np.ones((2, 6, 6), dtype=np.float32) * 0.1,
             )
         }
 
-        rendered = render_workbench_selection(session, 4, 2, "Mean", 0.5)
+        rendered = render_workbench_selection(session, 4, 2, "Mean", 1, 0.5)
 
         self.assertIn('data-position="0"', rendered.context_html)
         self.assertIn('data-position="3"', rendered.context_html)
         self.assertNotIn('data-position="4"', rendered.context_html)
         self.assertNotIn('data-position="5"', rendered.context_html)
-        self.assertAlmostEqual(rendered.mass_summary["image"], 0.3)
+        self.assertAlmostEqual(rendered.mass_summary["image_1"], 0.3)
+        self.assertAlmostEqual(rendered.mass_summary["image_2"], 0.8)
+        self.assertAlmostEqual(rendered.mass_summary["image_total"], 1.1)
 
 
 class ServerImageTest(unittest.TestCase):
@@ -323,8 +384,24 @@ class PresentationTest(unittest.TestCase):
         self.assertEqual(selector.layers, (2, 7))
         self.assertEqual(selector.default_position, 4)
         self.assertEqual(selector.default_layer, 2)
+        self.assertEqual(selector.image_indices, (0, 1))
+        self.assertEqual(selector.default_image_index, 0)
         self.assertEqual(selector.heads_for(2), ("Mean", 0, 1))
         self.assertEqual(selector.heads_for(7), ("Mean", 0, 1, 2))
+
+    def test_text_only_selector_has_no_default_image(self):
+        session = _session()
+        session.images = ()
+        session.visual_grid_hws = ()
+        session.model_input_sizes = ()
+        session.layers = {
+            2: SimpleNamespace(visual=np.empty((2, 6, 0))),
+        }
+
+        selector = build_selector_state(session)
+
+        self.assertEqual(selector.image_indices, ())
+        self.assertIsNone(selector.default_image_index)
 
 
 @unittest.skipUnless(importlib.util.find_spec("gradio"), "Gradio is not installed")
@@ -425,22 +502,87 @@ class GradioBuildTest(unittest.TestCase):
         self.assertIn("#user-prompt-input textarea", demo.css)
         self.assertIn("align-items:stretch !important", demo.css)
         self.assertIn("resize:none", demo.css)
+        self.assertIn("Images", labels)
+        self.assertIn("Overlay image", labels)
+
         self.assertTrue(
             any(
                 getattr(block_function.fn, "__name__", "") == "on_token_click"
                 for block_function in demo.fns.values()
             )
         )
-        image_change_functions = [
+        upload_function = next(
             block_function
             for block_function in demo.fns.values()
-            if getattr(block_function.fn, "__name__", "") == "on_image_change"
-        ]
-        width_update, height_update = image_change_functions[0].fn(
-            Image.new("RGB", (640, 360))
+            if getattr(block_function.fn, "__name__", "") == "on_image_upload"
         )
-        self.assertEqual(width_update["value"], 640)
-        self.assertEqual(height_update["value"], 360)
+        first = Image.new("RGB", (320, 240), "red")
+        synced, selected_id, width_update, height_update = upload_function.fn(
+            [first],
+            [],
+        )
+        self.assertEqual(selected_id, synced[0]["id"])
+        self.assertEqual(width_update["value"], 320)
+        self.assertEqual(height_update["value"], 240)
+        self.assertEqual(width_update["label"], "Resize width · Image 1")
+        self.assertEqual(height_update["label"], "Resize height · Image 1")
+
+        resize_width_function = next(
+            block_function
+            for block_function in demo.fns.values()
+            if getattr(block_function.fn, "__name__", "") == "on_resize_width"
+        )
+        updated_specs = resize_width_function.fn(123, synced, selected_id)
+        reencoded_first = Image.new("RGB", (320, 240), "pink")
+        second = Image.new("RGB", (640, 360), "blue")
+        appended, selected_id, width_update, height_update = upload_function.fn(
+            [reencoded_first, second],
+            updated_specs,
+        )
+        self.assertEqual(appended[0]["width"], 123)
+        self.assertEqual(appended[1]["width"], 640)
+        self.assertEqual(selected_id, appended[1]["id"])
+        self.assertEqual(width_update["label"], "Resize width · Image 2")
+
+        select_function = next(
+            block_function
+            for block_function in demo.fns.values()
+            if getattr(block_function.fn, "__name__", "") == "on_image_select"
+        )
+        selected_id, selected_width, selected_height = select_function.fn(
+            appended,
+            SimpleNamespace(index=0),
+        )
+        self.assertEqual(selected_id, appended[0]["id"])
+        self.assertEqual(selected_width["value"], 123)
+        self.assertEqual(selected_width["label"], "Resize width · Image 1")
+        self.assertEqual(selected_height["label"], "Resize height · Image 1")
+
+        delete_function = next(
+            block_function
+            for block_function in demo.fns.values()
+            if getattr(block_function.fn, "__name__", "") == "on_image_delete"
+        )
+        remaining, selected_id, selected_width, selected_height = delete_function.fn(
+            appended,
+            selected_id,
+            SimpleNamespace(_data={"index": 1}),
+        )
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(selected_id, remaining[0]["id"])
+        self.assertEqual(selected_width["value"], 123)
+        self.assertEqual(selected_width["label"], "Resize width · Image 1")
+
+        remaining, selected_id, selected_width, selected_height = delete_function.fn(
+            appended,
+            appended[0]["id"],
+            SimpleNamespace(_data={"index": 0}),
+        )
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(selected_id, remaining[0]["id"])
+        self.assertEqual(selected_width["value"], 640)
+        self.assertEqual(selected_width["label"], "Resize width · Image 1")
+        self.assertEqual(selected_height["value"], 360)
         self.assertEqual(
             sum(
                 getattr(block_function.fn, "__name__", "")

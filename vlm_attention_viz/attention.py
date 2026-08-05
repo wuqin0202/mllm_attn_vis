@@ -39,9 +39,9 @@ class AttentionSession:
     context_key_positions: np.ndarray
     causal_context_mask: np.ndarray
     layers: dict[int, LayerAttention]
-    visual_grid_hw: tuple[int, int] | None
-    image: Image.Image | None
-    model_input_size: tuple[int, int] | None
+    visual_grid_hws: tuple[tuple[int, int], ...]
+    images: tuple[Image.Image, ...]
+    model_input_sizes: tuple[tuple[int, int], ...]
 
 
 @dataclass(frozen=True)
@@ -240,35 +240,76 @@ def _decode_token_chunks(tokenizer, ids: Sequence[int]) -> list[str]:
     ]
 
 
-def resolve_visual_grid(
+def resolve_visual_grids(
     image_grid_thw,
     spatial_merge_size: int,
     visual_token_count: int,
-) -> tuple[int, int]:
-    """Validate and return the processor-provided merged patch grid."""
+    image_count: int,
+) -> tuple[tuple[int, int], ...]:
+    """Validate processor metadata and return one merged patch grid per image."""
     if image_grid_thw is None:
         raise ValueError("Processor image_grid_thw metadata is required")
     if isinstance(image_grid_thw, torch.Tensor):
         grid = image_grid_thw.detach().cpu().numpy()
     else:
         grid = np.asarray(image_grid_thw)
-    if grid.shape != (1, 3):
-        raise ValueError(f"Single-image grid metadata must have shape (1, 3), actual {grid.shape}")
-    temporal, height, width = (int(value) for value in grid[0])
-    if temporal != 1:
-        raise ValueError(f"Single-image temporal grid must be 1, actual {temporal}")
-    if spatial_merge_size <= 0 or height % spatial_merge_size or width % spatial_merge_size:
+    if grid.ndim != 2 or grid.shape[1] != 3:
+        raise ValueError(f"Image grid metadata must have shape (N, 3), actual {grid.shape}")
+    if grid.shape[0] != int(image_count):
         raise ValueError(
-            f"Grid ({height}, {width}) is not divisible by spatial_merge_size={spatial_merge_size}"
+            f"Expected {image_count} images but processor returned {grid.shape[0]} grid rows"
         )
-    merged = (height // spatial_merge_size, width // spatial_merge_size)
-    expected = merged[0] * merged[1]
+    if spatial_merge_size <= 0:
+        raise ValueError("spatial_merge_size must be positive")
+
+    merged_grids = []
+    for image_index, row in enumerate(grid):
+        temporal, height, width = (int(value) for value in row)
+        if temporal != 1:
+            raise ValueError(
+                f"Image {image_index + 1} temporal grid must be 1, actual {temporal}"
+            )
+        if height % spatial_merge_size or width % spatial_merge_size:
+            raise ValueError(
+                f"Image {image_index + 1} grid ({height}, {width}) is not divisible by "
+                f"spatial_merge_size={spatial_merge_size}"
+            )
+        merged_grids.append(
+            (height // spatial_merge_size, width // spatial_merge_size)
+        )
+
+    expected = sum(height * width for height, width in merged_grids)
     if expected != visual_token_count:
         raise ValueError(
-            f"Merged patch count mismatch: expected {expected} from processor grid, "
+            f"Merged patch count mismatch: expected {expected} from processor grids, "
             f"actual {visual_token_count} image tokens"
         )
-    return merged
+    return tuple(merged_grids)
+
+
+def validate_visual_token_groups(
+    visual_positions: np.ndarray,
+    grid_hws: Sequence[tuple[int, int]],
+) -> None:
+    """Ensure each image-pad run matches its processor grid in image order."""
+    positions = np.asarray(visual_positions, dtype=np.int64)
+    if not grid_hws:
+        if positions.size:
+            raise ValueError("Visual tokens exist without any image grids")
+        return
+    boundaries = np.flatnonzero(np.diff(positions) != 1) + 1
+    groups = np.split(positions, boundaries)
+    if len(groups) != len(grid_hws):
+        raise ValueError(
+            f"Expected {len(grid_hws)} image token groups, actual {len(groups)}"
+        )
+    for image_index, (group, grid_hw) in enumerate(zip(groups, grid_hws)):
+        expected = int(grid_hw[0]) * int(grid_hw[1])
+        if group.size != expected:
+            raise ValueError(
+                f"Image {image_index + 1} patch count mismatch: expected {expected}, "
+                f"actual {group.size} image tokens"
+            )
 
 
 def select_attention_head(values: np.ndarray, head: int | str) -> np.ndarray:
@@ -388,41 +429,49 @@ class AttentionCapture:
 def extract_attention(
     model,
     processor,
-    image: Image.Image | None,
+    images: Sequence[Image.Image],
     user_prompt: str,
     system_prompt: str = "",
     max_new_tokens: int = 256,
     device: str = "cuda",
-    resize_width: int | None = None,
-    resize_height: int | None = None,
+    resize_sizes: Sequence[tuple[int, int]] | None = None,
 ) -> AttentionSession:
-    """Run generation from an image, user text, or both and build an attention session."""
-    has_image = image is not None
+    """Run generation from zero or more images and optional text."""
+    if isinstance(images, (str, bytes)) or not isinstance(images, Sequence):
+        raise TypeError("images must be a sequence of PIL.Image.Image values")
+    if any(not isinstance(image, Image.Image) for image in images):
+        raise TypeError("Every input image must be a PIL.Image.Image")
+    has_images = bool(images)
     has_text = bool(user_prompt and user_prompt.strip())
-    if not has_image and not has_text:
+    if not has_images and not has_text:
         raise ValueError("At least one image or non-empty user prompt is required")
-    if has_image and not isinstance(image, Image.Image):
-        raise TypeError("image must be a single PIL.Image.Image or None")
     if max_new_tokens < 1:
         raise ValueError("max_new_tokens must be at least 1")
-    if has_image:
-        image = image.convert("RGB") if image.mode != "RGB" else image.copy()
+    images = tuple(
+        image.convert("RGB") if image.mode != "RGB" else image.copy()
+        for image in images
+    )
 
     messages = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
     content = []
     patch_size = merge_size = 0
-    if has_image:
-        image_content = {"type": "image", "image": image}
-        if resize_width is None or resize_height is None:
-            raise ValueError(
-                "resize_width and resize_height are required when an image is provided"
-            )
-        resize_width = int(resize_width)
-        resize_height = int(resize_height)
-        if resize_width <= 0 or resize_height <= 0:
-            raise ValueError("resize dimensions must be positive")
+    if has_images:
+        if resize_sizes is None or len(resize_sizes) != len(images):
+            raise ValueError("resize_sizes must contain one size for every image")
+        normalized_sizes = []
+        for image_index, size in enumerate(resize_sizes):
+            if len(size) != 2:
+                raise ValueError(
+                    f"Image {image_index + 1} resize size must contain width and height"
+                )
+            width, height = (int(dimension) for dimension in size)
+            if width <= 0 or height <= 0:
+                raise ValueError(
+                    f"Image {image_index + 1} resize dimensions must be positive"
+                )
+            normalized_sizes.append((width, height))
         vision_config = getattr(model.config, "vision_config", None)
         image_processor = getattr(processor, "image_processor", None)
         patch_size = int(
@@ -434,8 +483,15 @@ def extract_attention(
             raise ValueError(
                 "model.config.vision_config.patch_size and spatial_merge_size are required"
             )
-        image_content.update(resized_width=resize_width, resized_height=resize_height)
-        content.append(image_content)
+        content.extend(
+            {
+                "type": "image",
+                "image": image,
+                "resized_width": width,
+                "resized_height": height,
+            }
+            for image, (width, height) in zip(images, normalized_sizes)
+        )
     if has_text:
         content.append({"type": "text", "text": user_prompt})
 
@@ -454,20 +510,29 @@ def extract_attention(
     )
 
     processor_kwargs = {"text": [text_input], "padding": True, "return_tensors": "pt"}
-    model_input_size = None
-    if has_image:
+    model_input_sizes: tuple[tuple[int, int], ...] = ()
+    if has_images:
         from qwen_vl_utils import process_vision_info
 
         image_inputs, _ = process_vision_info(messages, image_patch_size=patch_size)
-        if len(image_inputs) != 1 or not isinstance(image_inputs[0], Image.Image):
-            raise ValueError("Vision preprocessing must return exactly one PIL image")
-        model_input_size = tuple(int(dimension) for dimension in image_inputs[0].size)
+        if len(image_inputs) != len(images) or any(
+            not isinstance(image, Image.Image) for image in image_inputs
+        ):
+            raise ValueError("Vision preprocessing must return one PIL image per input image")
+        model_input_sizes = tuple(
+            tuple(int(dimension) for dimension in image.size) for image in image_inputs
+        )
         spatial_factor = patch_size * merge_size
-        if any(dimension % spatial_factor for dimension in model_input_size):
+        incompatible_sizes = [
+            size
+            for size in model_input_sizes
+            if any(dimension % spatial_factor for dimension in size)
+        ]
+        if incompatible_sizes:
             raise RuntimeError(
-                "Vision preprocessing returned an image size that is incompatible with "
+                "Vision preprocessing returned image sizes that are incompatible with "
                 f"patch_size={patch_size} and spatial_merge_size={merge_size}: "
-                f"{model_input_size}. qwen-vl-utils>=0.0.14 is required."
+                f"{incompatible_sizes}. qwen-vl-utils>=0.0.14 is required."
             )
         processor_kwargs.update(images=image_inputs, do_resize=False)
     inputs = processor(**processor_kwargs)
@@ -499,22 +564,24 @@ def extract_attention(
         raise ValueError("Model returned no generated token")
 
     full_ids = torch.cat((input_ids, generated_ids.to(input_ids.device)), dim=1)
-    image_token_id = _image_token_id(model, processor) if has_image else None
+    image_token_id = _image_token_id(model, processor) if has_images else None
     metadata = build_session_metadata(
         processor.tokenizer,
         full_ids[0].tolist(),
         prompt_length,
         image_token_id,
     )
-    visual_grid_hw = (
-        resolve_visual_grid(
+    visual_grid_hws = (
+        resolve_visual_grids(
             inputs.get("image_grid_thw"),
             merge_size,
             len(metadata.visual_key_positions),
+            len(images),
         )
-        if has_image
-        else None
+        if has_images
+        else ()
     )
+    validate_visual_token_groups(metadata.visual_key_positions, visual_grid_hws)
     layer_indices = discover_full_attention_layers(model)
 
     full_inputs = dict(inputs)
@@ -543,10 +610,12 @@ def extract_attention(
         context_key_positions=metadata.context_key_positions,
         causal_context_mask=metadata.causal_context_mask,
         layers=dict(capture.layers),
-        visual_grid_hw=visual_grid_hw,
-        image=image,
-        model_input_size=model_input_size,
+        visual_grid_hws=visual_grid_hws,
+        images=images,
+        model_input_sizes=model_input_sizes,
     )
+
+
 def _image_token_id(model, processor) -> int:
     candidates = (
         getattr(model.config, "image_token_id", None),

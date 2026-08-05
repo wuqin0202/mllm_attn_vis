@@ -77,6 +77,7 @@ class SelectorState:
     selectable_positions: tuple[int, ...]
     layers: tuple[int, ...]
     heads_by_layer: dict[int, tuple[Any, ...]]
+    image_indices: tuple[int, ...]
 
     @property
     def default_position(self) -> int:
@@ -86,6 +87,10 @@ class SelectorState:
     @property
     def default_layer(self) -> int:
         return self.layers[0]
+
+    @property
+    def default_image_index(self) -> int | None:
+        return self.image_indices[0] if self.image_indices else None
 
     def heads_for(self, layer: int) -> tuple[Any, ...]:
         try:
@@ -108,12 +113,72 @@ def build_selector_state(session: Any) -> SelectorState:
         raise ValueError("The session contains no text tokens to inspect")
     if not layers:
         raise ValueError("The session contains no full-attention layers")
+    image_indices = tuple(range(len(session.images)))
+    if len(image_indices) != len(session.visual_grid_hws):
+        raise ValueError("The session image/grid counts do not match")
 
     heads_by_layer = {}
     for layer in layers:
         n_heads = int(session.layers[layer].visual.shape[0])
         heads_by_layer[layer] = ("Mean", *range(n_heads))
-    return SelectorState(session, selectable_positions, layers, heads_by_layer)
+    return SelectorState(
+        session,
+        selectable_positions,
+        layers,
+        heads_by_layer,
+        image_indices,
+    )
+
+
+def _gallery_images(value: Any) -> tuple[Any, ...]:
+    if not value:
+        return ()
+    images = []
+    for item in value:
+        if isinstance(item, (tuple, list)):
+            if not item:
+                raise ValueError("An uploaded image entry is empty")
+            item = item[0]
+        images.append(item)
+    return tuple(images)
+
+
+def append_image_resize_specs(
+    image_gallery: Any,
+    existing_specs: Any = None,
+) -> list[dict[str, Any]]:
+    """Append resize state for new Gallery images without touching prior state."""
+    images = _gallery_images(image_gallery)
+    specs = [dict(spec) for spec in existing_specs or ()]
+    if len(images) < len(specs):
+        raise ValueError("Image deletion must be handled by its Gallery delete event")
+    for image in images[len(specs) :]:
+        if not isinstance(image, PILImage.Image):
+            raise TypeError("Gallery entries must be PIL images")
+        specs.append(
+            {
+                "id": str(uuid4()),
+                "width": int(image.width),
+                "height": int(image.height),
+            }
+        )
+    return specs
+
+
+def _resize_sizes(resize_specs: Any, image_count: int) -> tuple[tuple[int, int], ...]:
+    specs = list(resize_specs or ())
+    if len(specs) != int(image_count):
+        raise ValueError(
+            f"Resize settings must match the {image_count} input images; "
+            f"actual {len(specs)}"
+        )
+    return tuple(
+        (
+            _positive_dimension(spec.get("width"), f"Image {index + 1} resize width"),
+            _positive_dimension(spec.get("height"), f"Image {index + 1} resize height"),
+        )
+        for index, spec in enumerate(specs)
+    )
 
 
 def run_inference(
@@ -121,36 +186,29 @@ def run_inference(
     extractor: Callable[..., Any],
     model: Any,
     processor: Any,
-    image: Any,
+    image_gallery: Any,
     system_prompt: str,
     user_prompt: str,
     max_new_tokens: int,
     device: str,
-    resize_width: Any,
-    resize_height: Any,
+    resize_specs: Any,
 ) -> tuple[str, SelectorState]:
     """Validate inputs, perform one inference, and cache the resulting session."""
-    has_image = image is not None
+    images = _gallery_images(image_gallery)
     has_text = bool(user_prompt and user_prompt.strip())
-    if not has_image and not has_text:
+    if not images and not has_text:
         raise ValueError("At least one image or non-empty user prompt is required")
-    requested_width = (
-        _positive_dimension(resize_width, "Resize width") if has_image else None
-    )
-    requested_height = (
-        _positive_dimension(resize_height, "Resize height") if has_image else None
-    )
+    resize_sizes = _resize_sizes(resize_specs, len(images))
 
     session = extractor(
         model=model,
         processor=processor,
-        image=image,
+        images=images,
         user_prompt=user_prompt,
         system_prompt=system_prompt or "",
         max_new_tokens=int(max_new_tokens),
         device=device,
-        resize_width=requested_width,
-        resize_height=requested_height,
+        resize_sizes=resize_sizes,
     )
     selector = build_selector_state(session)
     return cache.put(session), selector
@@ -218,6 +276,7 @@ def render_cached_session(
     selected_position: int,
     layer: int,
     head: Any,
+    image_index: int | None,
     opacity: float,
     *,
     renderer: Callable[..., Any],
@@ -229,6 +288,7 @@ def render_cached_session(
         int(selected_position),
         int(layer),
         _coerce_head(head),
+        None if image_index is None else int(image_index),
         float(opacity),
     )
 
@@ -238,12 +298,20 @@ def render_workbench_selection(
     selected_position: int,
     layer: int,
     head: Any,
+    image_index: int | None,
     opacity: float,
 ) -> WorkbenchRender:
     """Adapt a raw renderer slice to the workbench's causal presentation."""
-    from .render import attention_masses, render_selection
+    from .render import attention_masses, render_selection, split_visual_attention
 
-    selection = render_selection(session, selected_position, layer, head, opacity)
+    selection = render_selection(
+        session,
+        selected_position,
+        layer,
+        head,
+        image_index,
+        opacity,
+    )
     positions = np.asarray(session.selectable_positions)
     matches = np.flatnonzero(positions == int(selected_position))
     if matches.size != 1:
@@ -254,7 +322,17 @@ def render_workbench_selection(
 
     causal_context = np.where(causal_mask, selection.context, 0.0)
     masses = attention_masses(causal_context, session.context_key_positions, session.tokens)
-    masses = {"image": float(np.sum(selection.visual, dtype=np.float64)), **masses}
+    visual_parts = split_visual_attention(selection.visual, session.visual_grid_hws)
+    image_masses = {
+        f"image_{index + 1}": float(np.sum(values, dtype=np.float64))
+        for index, values in enumerate(visual_parts)
+    }
+    if image_masses:
+        masses = {
+            **image_masses,
+            "image_total": float(np.sum(selection.visual, dtype=np.float64)),
+            **masses,
+        }
     context_markup = _causal_context_html(
         session,
         causal_mask,
@@ -380,24 +458,28 @@ def build_app(
     cache = cache if cache is not None else SessionCache()
     allowed_image_roots = _normalize_image_roots(image_roots)
 
-    def render_outputs(session_id, selected_position, layer, head, opacity):
+    def render_outputs(session_id, selected_position, layer, head, image_index, opacity):
         selection = render_cached_session(
             cache,
             session_id,
             selected_position,
             layer,
             head,
+            image_index,
             opacity,
             renderer=render_workbench_selection,
         )
         session = cache.get(session_id)
-        if session.image is None:
+        if image_index is None:
             input_status = "Text-only input"
         else:
-            source_width, source_height = session.image.size
-            model_width, model_height = session.model_input_size
+            selected_image = int(image_index)
+            source_width, source_height = session.images[selected_image].size
+            model_width, model_height = session.model_input_sizes[selected_image]
             input_status = (
-                f"Input {source_width} x {source_height} -> {model_width} x {model_height}"
+                f"Image {selected_image + 1}/{len(session.images)} | "
+                f"Input {source_width} x {source_height} -> "
+                f"{model_width} x {model_height}"
             )
         return (
             token_ribbon_html(session, int(selected_position)),
@@ -410,11 +492,10 @@ def build_app(
         )
 
     def on_run(
-        image,
+        image_gallery,
         system_prompt,
         user_prompt,
-        resize_width,
-        resize_height,
+        resize_specs,
         max_new_tokens,
     ):
         session_id, selector = run_inference(
@@ -422,55 +503,137 @@ def build_app(
             extractor,
             model,
             processor,
-            image,
+            image_gallery,
             system_prompt,
             user_prompt,
             max_new_tokens,
             device,
-            resize_width=resize_width,
-            resize_height=resize_height,
+            resize_specs=resize_specs,
         )
         position = selector.default_position
         layer = selector.default_layer
         head = "Mean"
+        image_index = selector.default_image_index
         ribbon, spatial, context, mass, status = render_outputs(
-            session_id, position, layer, head, 0.55
+            session_id, position, layer, head, image_index, 0.55
         )
+        image_choices = [
+            (f"Image {index + 1}", index) for index in selector.image_indices
+        ]
         return (
             session_id,
             ribbon,
             position,
             gr.update(choices=list(selector.layers), value=layer),
             gr.update(choices=list(selector.heads_for(layer)), value=head),
+            gr.update(choices=image_choices, value=image_index),
             spatial,
             context,
             mass,
             status,
         )
 
-    def on_layer(session_id, selected_position, layer, opacity):
+    def on_layer(session_id, selected_position, layer, image_index, opacity):
         selector = build_selector_state(cache.get(session_id))
         heads = selector.heads_for(int(layer))
-        outputs = render_outputs(session_id, selected_position, layer, "Mean", opacity)
+        outputs = render_outputs(
+            session_id,
+            selected_position,
+            layer,
+            "Mean",
+            image_index,
+            opacity,
+        )
         return gr.update(choices=list(heads), value="Mean"), *outputs
 
-    def on_token_click(click_value, session_id, layer, head, opacity):
+    def on_token_click(click_value, session_id, layer, head, image_index, opacity):
         position = int(str(click_value).split(":", 1)[0])
-        return position, *render_outputs(session_id, position, layer, head, opacity)
+        return position, *render_outputs(
+            session_id,
+            position,
+            layer,
+            head,
+            image_index,
+            opacity,
+        )
 
-    def on_image_change(image):
-        if image is None:
-            return gr.update(value=None), gr.update(value=None)
-        width, height = image.size
-        return gr.update(value=width), gr.update(value=height)
+    def resize_updates(resize_specs, selected_id):
+        for index, spec in enumerate(resize_specs or ()):
+            if spec.get("id") == selected_id:
+                image_number = index + 1
+                return (
+                    gr.update(
+                        value=spec.get("width"),
+                        label=f"Resize width · Image {image_number}",
+                    ),
+                    gr.update(
+                        value=spec.get("height"),
+                        label=f"Resize height · Image {image_number}",
+                    ),
+                )
+        return (
+            gr.update(value=None, label="Resize width"),
+            gr.update(value=None, label="Resize height"),
+        )
 
-    def on_server_image_load(image_path):
+    def on_image_upload(image_gallery, resize_specs):
+        specs = append_image_resize_specs(image_gallery, resize_specs)
+        selected_id = specs[-1]["id"] if specs else None
+        return specs, selected_id, *resize_updates(specs, selected_id)
+
+    def on_image_change(image_gallery):
+        if _gallery_images(image_gallery):
+            return gr.skip(), gr.skip(), gr.skip(), gr.skip()
+        return [], None, *resize_updates([], None)
+
+    def on_image_delete(resize_specs, selected_id, event):
+        specs = [dict(spec) for spec in resize_specs or ()]
+        index = int(event._data["index"])
+        if not 0 <= index < len(specs):
+            raise ValueError(f"Deleted image index {index} is unavailable")
+        deleted_id = specs[index]["id"]
+        specs.pop(index)
+        if selected_id == deleted_id:
+            selected_id = specs[min(index, len(specs) - 1)]["id"] if specs else None
+        return specs, selected_id, *resize_updates(specs, selected_id)
+
+    on_image_delete.__annotations__["event"] = gr.EventData
+
+    def on_image_select(resize_specs, event):
+        index = int(event.index)
+        specs = list(resize_specs or ())
+        if not 0 <= index < len(specs):
+            raise ValueError(f"Selected image index {index} is unavailable")
+        selected_id = specs[index]["id"]
+        return selected_id, *resize_updates(specs, selected_id)
+
+    on_image_select.__annotations__["event"] = gr.SelectData
+
+    def update_resize_value(value, resize_specs, selected_id, field):
+        specs = [dict(spec) for spec in resize_specs or ()]
+        for spec in specs:
+            if spec.get("id") == selected_id:
+                spec[field] = value
+                return specs
+        raise ValueError("Select an input image before changing its resize settings")
+
+    def on_resize_width(value, resize_specs, selected_id):
+        return update_resize_value(value, resize_specs, selected_id, "width")
+
+    def on_resize_height(value, resize_specs, selected_id):
+        return update_resize_value(value, resize_specs, selected_id, "height")
+
+    def on_server_image_load(image_path, image_gallery, resize_specs):
         image = load_server_image(image_path, allowed_image_roots)
         width, height = image.size
+        images = [*_gallery_images(image_gallery), image]
+        specs = append_image_resize_specs(images, resize_specs)
+        selected_id = specs[-1]["id"]
         return (
-            image,
-            gr.update(value=width),
-            gr.update(value=height),
+            gr.update(value=images, selected_index=len(images) - 1),
+            specs,
+            selected_id,
+            *resize_updates(specs, selected_id),
             f"Server image loaded ({width} x {height})",
         )
 
@@ -525,6 +688,8 @@ def build_app(
     with gr.Blocks(title="VLM Attention Workbench", css=css, js=TOKEN_RIBBON_JS) as demo:
         session_state = gr.State("")
         query_state = gr.State(None)
+        resize_specs_state = gr.State([])
+        selected_input_image_state = gr.State(None)
         token_click = gr.Textbox(
             value="",
             show_label=False,
@@ -535,9 +700,13 @@ def build_app(
         gr.Markdown("# VLM Attention Workbench")
         with gr.Row(equal_height=True, elem_id="primary-input-row"):
             with gr.Column(scale=1, elem_id="image-input-column"):
-                image_input = gr.Image(
+                image_input = gr.Gallery(
                     type="pil",
-                    label="Image",
+                    label="Images",
+                    columns=3,
+                    rows=2,
+                    object_fit="contain",
+                    interactive=True,
                     elem_id="attention-image-input",
                 )
                 with gr.Row(elem_id="server-image-path-row"):
@@ -608,6 +777,7 @@ def build_app(
         with gr.Row():
             layer = gr.Dropdown(label="Full-attention layer", choices=[])
             head = gr.Dropdown(label="Head", choices=[])
+            image_index = gr.Dropdown(label="Overlay image", choices=[])
             opacity = gr.Slider(0, 1, value=0.55, label="Overlay opacity")
         with gr.Tabs():
             with gr.Tab("Spatial"):
@@ -628,8 +798,7 @@ def build_app(
                 image_input,
                 system_input,
                 user_input,
-                resize_width,
-                resize_height,
+                resize_specs_state,
                 max_tokens,
             ],
             outputs=[
@@ -638,6 +807,7 @@ def build_app(
                 query_state,
                 layer,
                 head,
+                image_index,
                 spatial,
                 context,
                 mass,
@@ -648,35 +818,88 @@ def build_app(
         image_input.change(
             on_image_change,
             image_input,
-            [resize_width, resize_height],
+            [
+                resize_specs_state,
+                selected_input_image_state,
+                resize_width,
+                resize_height,
+            ],
             queue=False,
         )
-        server_image_outputs = [image_input, resize_width, resize_height, status]
+        image_input.upload(
+            on_image_upload,
+            [image_input, resize_specs_state],
+            [
+                resize_specs_state,
+                selected_input_image_state,
+                resize_width,
+                resize_height,
+            ],
+            queue=False,
+        )
+        image_input.delete(
+            on_image_delete,
+            [resize_specs_state, selected_input_image_state],
+            [
+                resize_specs_state,
+                selected_input_image_state,
+                resize_width,
+                resize_height,
+            ],
+            queue=False,
+        )
+        image_input.select(
+            on_image_select,
+            resize_specs_state,
+            [selected_input_image_state, resize_width, resize_height],
+            queue=False,
+        )
+        resize_width.input(
+            on_resize_width,
+            [resize_width, resize_specs_state, selected_input_image_state],
+            resize_specs_state,
+            queue=False,
+        )
+        resize_height.input(
+            on_resize_height,
+            [resize_height, resize_specs_state, selected_input_image_state],
+            resize_specs_state,
+            queue=False,
+        )
+        server_image_outputs = [
+            image_input,
+            resize_specs_state,
+            selected_input_image_state,
+            resize_width,
+            resize_height,
+            status,
+        ]
         load_server_image_button.click(
             on_server_image_load,
-            server_image_path,
+            [server_image_path, image_input, resize_specs_state],
             server_image_outputs,
             queue=False,
         )
         server_image_path.submit(
             on_server_image_load,
-            server_image_path,
+            [server_image_path, image_input, resize_specs_state],
             server_image_outputs,
             queue=False,
         )
-        common_inputs = [session_state, query_state, layer, head, opacity]
+        common_inputs = [session_state, query_state, layer, head, image_index, opacity]
         common_outputs = [ribbon, spatial, context, mass, status]
         head.change(render_outputs, common_inputs, common_outputs, queue=False)
+        image_index.change(render_outputs, common_inputs, common_outputs, queue=False)
         opacity.change(render_outputs, common_inputs, common_outputs, queue=False)
         layer.change(
             on_layer,
-            [session_state, query_state, layer, opacity],
+            [session_state, query_state, layer, image_index, opacity],
             [head, ribbon, spatial, context, mass, status],
             queue=False,
         )
         token_click.input(
             on_token_click,
-            [token_click, session_state, layer, head, opacity],
+            [token_click, session_state, layer, head, image_index, opacity],
             [query_state, ribbon, spatial, context, mass, status],
             queue=False,
         )

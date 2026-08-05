@@ -16,8 +16,9 @@ from vlm_attention_viz.attention import (
     discover_full_attention_layers,
     extract_attention,
     load_model,
-    resolve_visual_grid,
+    resolve_visual_grids,
     select_attention_head,
+    validate_visual_token_groups,
 )
 
 
@@ -177,14 +178,25 @@ class LayerDiscoveryTest(unittest.TestCase):
 
 
 class GridTest(unittest.TestCase):
-    def test_uses_merged_processor_grid(self):
-        self.assertEqual(resolve_visual_grid([[1, 8, 12]], 2, 24), (4, 6))
+    def test_uses_merged_processor_grids_for_multiple_images(self):
+        self.assertEqual(
+            resolve_visual_grids([[1, 8, 12], [1, 4, 8]], 2, 32, 2),
+            ((4, 6), (2, 4)),
+        )
 
     def test_grid_mismatch_reports_expected_and_actual(self):
-        with self.assertRaisesRegex(ValueError, "expected 24.*actual 23"):
-            resolve_visual_grid([[1, 8, 12]], 2, 23)
+        with self.assertRaisesRegex(ValueError, "expected 32.*actual 31"):
+            resolve_visual_grids([[1, 8, 12], [1, 4, 8]], 2, 31, 2)
         with self.assertRaisesRegex(ValueError, "metadata"):
-            resolve_visual_grid(None, 2, 24)
+            resolve_visual_grids(None, 2, 24, 1)
+        with self.assertRaisesRegex(ValueError, "2 images.*1 grid"):
+            resolve_visual_grids([[1, 8, 12]], 2, 24, 2)
+
+    def test_rejects_wrong_per_image_patch_partition_even_when_total_matches(self):
+        visual_positions = np.array([1, 2, 4, 5, 6, 7])
+        validate_visual_token_groups(visual_positions, ((1, 2), (2, 2)))
+        with self.assertRaisesRegex(ValueError, "Image 1.*expected 4.*actual 2"):
+            validate_visual_token_groups(visual_positions, ((2, 2), (1, 2)))
 
 
 class HeadSelectionTest(unittest.TestCase):
@@ -313,10 +325,11 @@ class FakeProcessor:
 
     def __call__(self, **kwargs):
         self.call_kwargs = kwargs
+        self.processor_images = kwargs["images"]
         return {
-            "input_ids": torch.tensor([[10, 99, 99, 11]]),
-            "attention_mask": torch.ones((1, 4), dtype=torch.long),
-            "image_grid_thw": torch.tensor([[1, 2, 4]]),
+            "input_ids": torch.tensor([[10, 99, 99, 11, 99, 99, 99, 99, 11]]),
+            "attention_mask": torch.ones((1, 9), dtype=torch.long),
+            "image_grid_thw": torch.tensor([[1, 2, 4], [1, 4, 4]]),
         }
 
 
@@ -355,15 +368,22 @@ class FakeModel:
 
 
 class ExtractionIntegrationTest(unittest.TestCase):
-    def test_builds_compact_session_from_full_attention_layers_only(self):
+    def test_builds_compact_multi_image_session_from_full_attention_layers_only(self):
         model = FakeModel()
         processor = FakeProcessor()
-        processed_image = Image.new("RGB", (8, 4))
+        source_images = [
+            Image.new("L", (4, 4), 64),
+            Image.new("RGB", (8, 4), "blue"),
+        ]
+        processed_images = [
+            Image.new("RGB", (8, 4)),
+            Image.new("RGB", (8, 8)),
+        ]
         vision_call = {}
 
         def process_vision_info(messages, **kwargs):
             vision_call.update(kwargs)
-            return [processed_image], None
+            return processed_images, None
 
         vision_module = types.SimpleNamespace(
             process_vision_info=process_vision_info
@@ -373,30 +393,36 @@ class ExtractionIntegrationTest(unittest.TestCase):
             session = extract_attention(
                 model,
                 processor,
-                Image.new("L", (4, 4)),
+                source_images,
                 user_prompt="describe",
                 system_prompt="",
                 max_new_tokens=2,
                 device="cpu",
-                resize_width=6,
-                resize_height=5,
+                resize_sizes=((6, 5), (7, 9)),
             )
 
         self.assertEqual([message["role"] for message in processor.messages], ["user"])
         self.assertEqual(model.generate_calls, 1)
         self.assertEqual(model.forward_calls, 1)
         self.assertEqual(list(session.layers), [1])
-        self.assertEqual(session.generated_positions.tolist(), [4, 5])
-        self.assertEqual(session.selectable_positions.tolist(), [0, 3, 4, 5])
-        self.assertEqual(session.query_positions.tolist(), [0, 3, 4, 5])
-        self.assertEqual(session.layers[1].visual.shape, (2, 4, 2))
-        self.assertEqual(session.layers[1].context.shape, (2, 4, 4))
-        self.assertEqual(session.visual_grid_hw, (1, 2))
-        self.assertEqual(session.image.mode, "RGB")
-        self.assertEqual(session.model_input_size, (8, 4))
-        image_content = processor.messages[0]["content"][0]
-        self.assertEqual(image_content["resized_width"], 6)
-        self.assertEqual(image_content["resized_height"], 5)
+        self.assertEqual(session.generated_positions.tolist(), [9, 10])
+        self.assertEqual(session.selectable_positions.tolist(), [0, 3, 8, 9, 10])
+        self.assertEqual(session.query_positions.tolist(), [0, 3, 8, 9, 10])
+        self.assertEqual(session.layers[1].visual.shape, (2, 5, 6))
+        self.assertEqual(session.layers[1].context.shape, (2, 5, 5))
+        self.assertEqual(session.visual_grid_hws, ((1, 2), (2, 2)))
+        self.assertEqual([image.mode for image in session.images], ["RGB", "RGB"])
+        self.assertEqual(session.model_input_sizes, ((8, 4), (8, 8)))
+        self.assertEqual(len(processor.messages[-1]["content"]), 3)
+        self.assertEqual(len(processor.processor_images), 2)
+        image_contents = processor.messages[0]["content"][:2]
+        self.assertEqual(
+            [
+                (content["resized_width"], content["resized_height"])
+                for content in image_contents
+            ],
+            [(6, 5), (7, 9)],
+        )
         self.assertEqual(vision_call["image_patch_size"], 2)
         self.assertFalse(processor.call_kwargs["do_resize"])
         self.assertEqual(model.modules[0].hooks, [])
@@ -416,28 +442,37 @@ class ExtractionIntegrationTest(unittest.TestCase):
         session = extract_attention(
             model,
             processor,
-            None,
+            (),
             user_prompt="describe",
             max_new_tokens=2,
             device="cpu",
-            resize_width=None,
-            resize_height=None,
+            resize_sizes=(),
         )
 
         self.assertEqual(processor.messages[0]["content"], [{"type": "text", "text": "describe"}])
         self.assertNotIn("images", processor.call_kwargs)
         self.assertNotIn("do_resize", processor.call_kwargs)
-        self.assertIsNone(session.image)
-        self.assertIsNone(session.model_input_size)
-        self.assertIsNone(session.visual_grid_hw)
+        self.assertEqual(session.images, ())
+        self.assertEqual(session.model_input_sizes, ())
+        self.assertEqual(session.visual_grid_hws, ())
         self.assertEqual(session.visual_key_positions.tolist(), [])
         self.assertEqual(session.selectable_positions.tolist(), [0, 1, 2, 3])
         self.assertEqual(session.layers[1].visual.shape, (2, 4, 0))
         self.assertEqual(session.layers[1].context.shape, (2, 4, 4))
 
     def test_supports_image_only_input(self):
+        class OneImageProcessor(FakeProcessor):
+            def __call__(self, **kwargs):
+                self.call_kwargs = kwargs
+                self.processor_images = kwargs["images"]
+                return {
+                    "input_ids": torch.tensor([[10, 99, 99, 11]]),
+                    "attention_mask": torch.ones((1, 4), dtype=torch.long),
+                    "image_grid_thw": torch.tensor([[1, 2, 4]]),
+                }
+
         model = FakeModel()
-        processor = FakeProcessor()
+        processor = OneImageProcessor()
         processed_image = Image.new("RGB", (8, 4))
         vision_module = types.SimpleNamespace(
             process_vision_info=lambda messages, **kwargs: ([processed_image], None)
@@ -447,12 +482,11 @@ class ExtractionIntegrationTest(unittest.TestCase):
             session = extract_attention(
                 model,
                 processor,
-                Image.new("RGB", (4, 4)),
+                (Image.new("RGB", (4, 4)),),
                 user_prompt="  ",
                 max_new_tokens=2,
                 device="cpu",
-                resize_width=4,
-                resize_height=4,
+                resize_sizes=((4, 4),),
             )
 
         self.assertEqual(len(processor.messages[0]["content"]), 1)
@@ -473,18 +507,22 @@ class Qwen35SmokeTest(unittest.TestCase):
         session = extract_attention(
             model,
             processor,
-            Image.new("RGB", (64, 64), "white"),
+            [
+                Image.new("RGB", (64, 64), "white"),
+                Image.new("RGB", (64, 64), "black"),
+            ],
             user_prompt="Describe this image in one word.",
             max_new_tokens=2,
             device="cuda:0",
-            resize_width=64,
-            resize_height=64,
+            resize_sizes=((64, 64), (96, 64)),
         )
 
         expected_layers = discover_full_attention_layers(model)
         self.assertEqual(list(session.layers), expected_layers)
         self.assertTrue(any(token.is_image for token in session.tokens))
         self.assertTrue(any(token.is_special and not token.is_image for token in session.tokens))
+        self.assertEqual(len(session.images), 2)
+        self.assertEqual(len(session.visual_grid_hws), 2)
         np.testing.assert_array_equal(
             session.query_positions,
             session.selectable_positions,

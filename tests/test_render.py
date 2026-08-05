@@ -12,6 +12,7 @@ from vlm_attention_viz.render import (
     render_heatmap,
     render_selection,
     select_attention_slice,
+    split_visual_attention,
 )
 
 
@@ -58,8 +59,8 @@ class RenderTests(unittest.TestCase):
                     context=np.array([[[0.9]]], dtype=np.float32),
                 )
             },
-            image=Image.new("RGB", (2, 1), "white"),
-            visual_grid_hw=(1, 2),
+            images=(Image.new("RGB", (2, 1), "white"),),
+            visual_grid_hws=((1, 2),),
             context_key_positions=np.array([0]),
             tokens=[
                 SimpleNamespace(
@@ -73,7 +74,7 @@ class RenderTests(unittest.TestCase):
             ],
         )
 
-        rendered = np.asarray(render_selection(session, 3, 1, 0, opacity=1).overlay)
+        rendered = np.asarray(render_selection(session, 3, 1, 0, 0, opacity=1).overlay)
 
         np.testing.assert_array_equal(rendered[0, 0], [0, 0, 255])
         np.testing.assert_array_equal(rendered[0, 1], [255, 0, 0])
@@ -87,8 +88,8 @@ class RenderTests(unittest.TestCase):
                     context=np.array([[[0.0, 0.0], [0.25, 0.0]]], dtype=np.float32),
                 )
             },
-            image=None,
-            visual_grid_hw=None,
+            images=(),
+            visual_grid_hws=(),
             context_key_positions=np.array([0, 1]),
             tokens=[
                 SimpleNamespace(
@@ -107,6 +108,41 @@ class RenderTests(unittest.TestCase):
 
         self.assertIsNone(rendered.overlay)
         self.assertEqual(rendered.visual.size, 0)
+
+    def test_selects_one_image_from_a_concatenated_visual_slice(self):
+        session = SimpleNamespace(
+            selectable_positions=np.array([3]),
+            generated_positions=np.array([3]),
+            layers={
+                1: SimpleNamespace(
+                    visual=np.array([[[0.9, 0.1, 0.2, 0.8, 0.3, 0.4]]], dtype=np.float32),
+                    context=np.array([[[0.1]]], dtype=np.float32),
+                )
+            },
+            images=(
+                Image.new("RGB", (2, 1), "white"),
+                Image.new("RGB", (2, 2), "white"),
+            ),
+            visual_grid_hws=((1, 2), (2, 2)),
+            context_key_positions=np.array([0]),
+            tokens=[
+                SimpleNamespace(
+                    absolute_position=0,
+                    token_id=1,
+                    raw_piece="text",
+                    decoded_preview="text",
+                    segment="prompt",
+                    is_special=False,
+                )
+            ],
+        )
+
+        selection = render_selection(session, 3, 1, 0, 1, opacity=0)
+
+        self.assertEqual(selection.overlay.size, (2, 2))
+        parts = split_visual_attention(selection.visual, session.visual_grid_hws)
+        np.testing.assert_allclose(parts[0], [0.9, 0.1])
+        np.testing.assert_allclose(parts[1], [0.2, 0.8, 0.3, 0.4])
 
     def test_raw_masses_preserve_groups(self):
         tokens = [

@@ -6,14 +6,14 @@ Inspect how a Qwen-family vision-language model attends to image patches and pri
 
 The first release supports:
 
-- zero or one image;
+- zero or more images in a single prompt;
 - an optional system prompt and an optional user prompt, with at least one image or non-empty user prompt required;
 - one assistant generation;
 - Qwen2-VL, Qwen2.5-VL, and dense or MoE Qwen3.5-VL model layouts supported by the installed Transformers version;
 - every tokenizer-produced token except the model's actual image-pad token;
 - all captured full-attention layers and every returned attention head, plus an on-demand mean.
 
-Multiple images, videos, multi-turn conversations, artifact persistence, and matrix comparison views are intentionally outside this release.
+Videos, multi-turn conversations, artifact persistence, and matrix comparison views are intentionally outside this release.
 
 ## Install
 
@@ -48,15 +48,16 @@ python -m vlm_attention_viz --help
 
 ## Workflow
 
-1. Optionally upload one image, or enter a permitted server-side path and select **Load**.
-2. Optionally enter a system prompt and a user prompt. At least the image or user prompt must be present.
-3. When using an image, enter the model input width and height. Uploading an image initializes both fields from its original dimensions; changing them independently may change the image's aspect ratio.
+1. Optionally upload one or more images, or append images by entering permitted server-side paths and selecting **Load**. Gallery order is prompt order.
+2. Optionally enter a system prompt and a user prompt. At least one image or a non-empty user prompt must be present.
+3. When using images, select one in the Gallery and enter its model input width and height. New images default to their original dimensions; each image keeps independent resize settings.
 4. Choose the maximum generation length and select **Run**.
 5. Select any visible input or generated text token by absolute sequence position.
 6. Click a text token in the sequence ribbon, then select a full-attention layer and `Mean` or an individual head.
-7. Inspect the Spatial view, Context view, opacity control, and raw attention mass summary.
+7. Select one image in **Overlay image** to inspect its spatial overlay.
+8. Inspect the Context view, opacity control, and per-image raw attention mass summary.
 
-For image input, the status shows the uploaded dimensions and the effective model-input dimensions. Each requested dimension is independently aligned to the nearest multiple of the model's `patch_size * spatial_merge_size`; this does not preserve the aspect ratio. The processor does not resize the aligned image a second time. For text-only input, the Spatial view is empty.
+After inference, the status shows the selected image's source dimensions and effective model-input dimensions. Each image's requested dimensions are independently aligned to the nearest multiples of the model's `patch_size * spatial_merge_size`; this does not preserve aspect ratio. The processor does not resize the aligned images a second time. For text-only input, the Spatial view is empty.
 
 The sequence ribbon preserves one selectable cell per non-image tokenizer token, including input tokens, generated tokens, chat-template markers, role tokens, vision boundaries, EOS, whitespace, byte fallback pieces, and other special tokens. Labels use contextual streaming decode so byte-level markers are readable; raw tokenizer pieces remain available in tooltips. Repeated token pieces remain distinct because selection uses absolute position rather than display text.
 
@@ -66,7 +67,7 @@ For a selected text token at absolute position `p`, the workbench reads attentio
 
 Image-pad tokens stay in the model sequence and attention column mapping but are hidden from the token ribbon. All other tokens remain visible. For hybrid Qwen3.5 models, linear-attention layers still participate in inference but are not hooked, stored, or offered in the layer selector.
 
-Spatial overlays use the selected image-patch slice's own min-max range, map low values to blue and high values to red, and blend the full map at the selected opacity. Context tokens keep their attention scale. Compare modalities, layers, or heads using raw values and modality masses rather than display color intensity.
+Visual keys are split by the processor-provided grid for each image and validated against each consecutive image-pad token group. Spatial overlays use the selected image-patch slice's own min-max range, map low values to blue and high values to red, and blend the full map at the selected opacity. Per-image raw masses preserve comparisons between images even though each overlay uses local visual contrast. Context tokens keep their attention scale. Compare modalities, layers, or heads using raw values and modality masses rather than display color intensity.
 
 Attention is an internal model weight, not a causal explanation or proof that a region caused the output. Head averaging can also hide distinct head behavior.
 

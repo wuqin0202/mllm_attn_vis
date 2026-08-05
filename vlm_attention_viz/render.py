@@ -159,6 +159,32 @@ def overlay_attention(
     return Image.blend(base, heatmap, float(alpha))
 
 
+def split_visual_attention(
+    visual: np.ndarray | Iterable[float],
+    grid_hws: Iterable[tuple[int, int]],
+) -> tuple[np.ndarray, ...]:
+    """Split concatenated visual attention using each image's merged patch grid."""
+    values = _finite_vector(visual, "visual")
+    parts = []
+    offset = 0
+    for image_index, grid_hw in enumerate(grid_hws):
+        height, width = (int(grid_hw[0]), int(grid_hw[1]))
+        if height <= 0 or width <= 0:
+            raise ValueError(
+                f"image {image_index + 1} grid dimensions must be positive, got {grid_hw}"
+            )
+        stop = offset + height * width
+        parts.append(values[offset:stop])
+        offset = stop
+    if not parts and values.size:
+        raise ValueError("visual attention exists without any visual grids")
+    if offset != values.size:
+        raise ValueError(
+            f"visual attention/grid mismatch: grids require {offset} values, got {values.size}"
+        )
+    return tuple(parts)
+
+
 def attention_masses(context: np.ndarray | Iterable[float], key_positions: Iterable[int], tokens: Iterable[Any]) -> dict[str, float]:
     """Sum raw context attention by prompt/generated and special/other groups."""
     values = _finite_vector(context, "context")
@@ -216,6 +242,7 @@ def render_selection(
     selected_position: int,
     layer: int,
     head: int | str = "Mean",
+    image_index: int | None = None,
     opacity: float = 0.55,
 ) -> RenderSelection:
     """Render one query x full-layer x head selection from an existing session."""
@@ -228,11 +255,24 @@ def render_selection(
     layer_obj = session.layers[int(layer)]
     visual, context = select_attention_slice(layer_obj, int(matches[0]), head)
     selected = normalize_slice(visual, context)
-    image = getattr(session, "image", None)
     overlay = None
-    if image is not None:
-        base = image.convert("RGB")
-        overlay = overlay_attention(base, selected.visual, session.visual_grid_hw, float(opacity))
+    images = tuple(getattr(session, "images", ()))
+    grid_hws = tuple(getattr(session, "visual_grid_hws", ()))
+    if len(images) != len(grid_hws):
+        raise ValueError("attention session image/grid counts do not match")
+    if images:
+        selected_image = 0 if image_index is None else int(image_index)
+        if not 0 <= selected_image < len(images):
+            raise IndexError(f"image {selected_image} outside [0, {len(images)})")
+        visual_parts = split_visual_attention(selected.visual, grid_hws)
+        overlay = overlay_attention(
+            images[selected_image].convert("RGB"),
+            visual_parts[selected_image],
+            grid_hws[selected_image],
+            float(opacity),
+        )
+    elif selected.visual.size:
+        raise ValueError("visual attention exists without any source images")
     key_positions = getattr(session, "context_key_positions", range(len(context)))
     context_html = _context_html(
         selected.context, selected.vmax, key_positions, getattr(session, "tokens", ())
@@ -251,4 +291,5 @@ __all__ = [
     "render_heatmap",
     "render_selection",
     "select_attention_slice",
+    "split_visual_attention",
 ]
